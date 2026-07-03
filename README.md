@@ -83,9 +83,9 @@ Column names match JSearch JSON field names exactly — this means the script ma
 
 ## Background and Motivation
 
-I've been applying to AI-adjacent roles — AI Evaluation, AI Ops, AI Enablement, Localization — for over two years. In that time I've tracked 140+ applications manually in a spreadsheet.
+In my job search, I have been using various job search sites for looking for roles and tracking those that I've applied to in a simple spreadsheet. This is time consuming, unwieldy, and doesn't have a memory. 
 
-This project started as a practical tool to automate the repetitive parts of that process. It's also a deliberate portfolio artifact: it demonstrates API integration, LLM orchestration, structured data design, and agentic thinking in a domain I know deeply — AI quality and evaluation.
+This project started as a practical tool to automate the repetitive parts of that process. It's also a deliberate portfolio artifact: it demonstrates API integration, LLM orchestration, structured data design, and agentic thinking in a domain I know deeply: AI quality and evaluation.
 
 The longer-term vision is a specialized AI career advisor that knows my full application history, learns from my outcomes, and gets smarter about what to surface over time.
 
