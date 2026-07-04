@@ -252,9 +252,10 @@ function analyzeExistingJobs() {
   const resumeEditsCol = headers.indexOf("resume_edits_suggested") + 1;
   const actualPostDateCol = headers.indexOf("actual_post_date") + 1;
 
-  // Read all rows in one call — much faster than reading one row at a time
-  // and avoids hitting Apps Script execution time limits on large sheets.
-  const allData = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+// Read all rows in one call then reverse so newest jobs (bottom of sheet)
+// get analyzed first — if the function times out the most recent listings
+// are already scored rather than only the oldest ones from the top.
+  const allData = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues().reverse;
 
   var analyzed = 0;
   var skipped = 0;
