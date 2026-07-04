@@ -1,277 +1,59 @@
 // ============================================================
-// JOB SEARCH AGENT v3 — Google Apps Script
+// JOB SEARCH AGENT v4 — Google Apps Script
 // Full pipeline: profile-driven queries, job fetching,
-// Gemini analysis, deduplication, profile refresh,
-// dynamic category management, and resume catalog.
+// Gemini analysis with real resume comparison, deduplication,
+// profile refresh, dynamic category management, resume catalog.
+//
+// HOW TO USE:
+//   Run runFullPipeline() daily — fetches new jobs then analyzes them.
+//   If it times out during analysis, just run analyzeExistingJobs() again.
+//   Run refreshProfile() when you update or add a resume.
+//   Run buildResumeCatalog() when you add new resumes to Drive.
 //
 // Functions:
+//   runFullPipeline()      — runs fetchJobsOnly() then analyzeExistingJobs()
+//   fetchJobsOnly()        — pulls jobs from JSearch, writes raw rows, no Gemini
+//   analyzeExistingJobs()  — analyzes unprocessed rows with Gemini + resume reading
+//   analyzeWithGemini()    — scores and categorizes a job description
+//   getResumeContent()     — reads a resume Doc from Drive by doc_id
+//   refreshProfile()       — updates PROFILE tab from new/changed resume Docs
+//   buildResumeCatalog()   — catalogs all resume Docs into RESUMES tab
+//   categorizeResume()     — calls Gemini to assign a category to one resume
 //   extractPostDate()      — regex helper to find dates in description text
+//   backfillPostDates()    — fills actual_post_date for rows missing it
 //   getCategories()        — reads CATEGORIES tab, returns array of labels
 //   addCategory()          — adds new category to CATEGORIES tab if not present
 //   getRoleCategoryInstruction() — builds dynamic category prompt for Gemini
-//   refreshProfile()       — reads new/updated resumes from Drive,
-//                            updates PROFILE tab with fresh summary and queries
-//   fetchJobs()            — reads queries from PROFILE tab, pulls jobs
-//                            from JSearch, analyzes with Gemini
-//   analyzeWithGemini()    — scores and categorizes a job description
-//   analyzeExistingJobs()  — backfills analysis on rows missing it
-//   backfillPostDates()    — fills actual_post_date for rows missing it
-//   buildResumeCatalog()   — reads Resume folder Docs, uses Gemini to categorize,
-//                            writes to RESUMES tab, auto-adds new categories
-//   categorizeResume()     — calls Gemini to assign a category to one resume
-//   getResumesByCategory() — lookup helper to filter resumes by category
+//   getResumesByCategory() — returns resume rows matching a given category
 // ============================================================
 
 
 // ============================================================
-// HELPER: EXTRACT POSTING DATE WITH REGEX
+// WRAPPER: RUN FULL PIPELINE
 // ============================================================
 
-function extractPostDate(text) {
-  // Scans the full untruncated job description for common date patterns near
-  // posting keywords — running on the full text before truncation means we never
-  // miss a date that appears after the character cutoff sent to Gemini.
-  if (!text) return "";
-
-  var patterns = [
-    /posted[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
-    /posted[:\s]+(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/i,
-    /date posted[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
-    /listing date[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
-    /posted on[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
-    /updated[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
-    /listed[:\s]+(\w+ \d{1,2},?\s*\d{4})/i
-  ];
-
-  for (var i = 0; i < patterns.length; i++) {
-    var match = text.match(patterns[i]);
-    if (match) return match[1].trim();
-  }
-  return "";
+function runFullPipeline() {
+  // Runs fetchJobsOnly() first to pull new jobs from JSearch with no AI calls,
+  // then immediately runs analyzeExistingJobs() to score and annotate each new
+  // row — if analyzeExistingJobs() times out before finishing, just run it again
+  // since it skips already-analyzed rows and picks up exactly where it left off.
+  Logger.log("=== Starting full pipeline ===");
+  fetchJobsOnly();
+  Logger.log("=== Fetch complete. Starting analysis ===");
+  analyzeExistingJobs();
+  Logger.log("=== Pipeline complete ===");
 }
 
 
 // ============================================================
-// HELPER: READ ALL EXISTING CATEGORIES FROM CATEGORIES TAB
+// STEP 1: FETCH JOBS FROM JSEARCH — NO GEMINI CALLS
 // ============================================================
 
-function getCategories() {
-  // Opens the CATEGORIES tab and returns a flat array of all category label
-  // strings currently in column A — this gets passed to Gemini so it can
-  // pick a consistent existing label before creating something new.
-  // Creates the tab with headers if it doesn't exist yet.
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  var catSheet = ss.getSheetByName("CATEGORIES");
-
-  if (!catSheet) {
-    catSheet = ss.insertSheet("CATEGORIES");
-    catSheet.getRange(1, 1, 1, 3).setValues([["category", "date_added", "source"]]);
-    Logger.log("Created new CATEGORIES tab.");
-    return [];
-  }
-
-  const data = catSheet.getDataRange().getValues();
-  var categories = [];
-
-  data.forEach(function(row, i) {
-    if (i === 0) return; // skip header row
-    if (row[0]) categories.push(row[0]);
-  });
-
-  return categories;
-}
-
-
-// ============================================================
-// HELPER: ADD NEW CATEGORY TO CATEGORIES TAB IF NOT PRESENT
-// ============================================================
-
-function addCategory(category, source) {
-  // Checks whether the category already exists before adding — prevents
-  // duplicates even if Gemini returns something already in the list.
-  // Records the label, today's date, and whether it came from a job or resume.
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const catSheet = ss.getSheetByName("CATEGORIES");
-  if (!catSheet) return;
-
-  const data = catSheet.getDataRange().getValues();
-  var exists = data.some(function(row) {
-    return row[0].toString().toLowerCase() === category.toLowerCase();
-  });
-
-  if (!exists) {
-    var today = new Date().toISOString().substring(0, 10);
-    catSheet.appendRow([category, today, source]);
-    Logger.log("New category added: " + category + " (source: " + source + ")");
-  }
-}
-
-
-// ============================================================
-// HELPER: BUILD DYNAMIC ROLE CATEGORY INSTRUCTION FOR GEMINI
-// ============================================================
-
-function getRoleCategoryInstruction() {
-  // Reads current categories from the CATEGORIES tab and returns a dynamic
-  // instruction string for the Gemini prompt — this keeps job categorization
-  // consistent with resume categorization since both draw from the same list.
-  var categories = getCategories();
-  if (categories.length > 0) {
-    return "pick the closest match from: " + categories.join(", ") + " — or create a concise new 2-4 word label if none fit, then it will be added to the category list automatically";
-  } else {
-    return "assign a concise 2-4 word category label that describes the target role";
-  }
-}
-
-
-// ============================================================
-// PROFILE REFRESH: READ NEW RESUMES FROM DRIVE, UPDATE PROFILE TAB
-// ============================================================
-
-function refreshProfile() {
+function fetchJobsOnly() {
 
   // --- CONFIG ---
-  // RESUME_FOLDER_ID is the Google Drive folder ID for your Resume folder —
-  // find it in the URL when you open the folder: drive.google.com/drive/folders/[ID]
-  // PROFILE_SHEET_NAME must match your tab name exactly.
-  const RESUME_FOLDER_ID = "1FKMiQkLfq2rcDFRnplIS7kUbtms92E0I";
-  const PROFILE_SHEET_NAME = "PROFILE";
-  const MAX_CHARS_PER_RESUME = 3000; // truncation per resume to manage token costs
-
-
-  // --- GET PROFILE SHEET AND READ LAST UPDATED TIMESTAMP ---
-  // The script reads the last_updated value from B2 to know which resumes to skip —
-  // only Docs modified after this date get re-read, keeping repeat runs cheap.
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const profileSheet = ss.getSheetByName(PROFILE_SHEET_NAME);
-
-  const lastUpdatedCell = profileSheet.getRange("B2").getValue();
-  const lastUpdated = lastUpdatedCell ? new Date(lastUpdatedCell) : new Date(0);
-  Logger.log("Last updated: " + lastUpdated);
-
-
-  // --- FIND NEW OR UPDATED RESUME DOCS IN DRIVE ---
-  // DriveApp opens the Resume folder and iterates through all files — we filter
-  // to only Google Docs modified after the last_updated timestamp, so PDFs and
-  // Word docs are automatically skipped without extra handling.
-  const folder = DriveApp.getFolderById(RESUME_FOLDER_ID);
-  const files = folder.getFiles();
-  var resumeTexts = [];
-
-  while (files.hasNext()) {
-    var file = files.next();
-
-    if (file.getMimeType() !== "application/vnd.google-apps.document") continue;
-
-    if (file.getLastUpdated() <= lastUpdated) {
-      Logger.log("Skipping unchanged: " + file.getName());
-      continue;
-    }
-
-    Logger.log("Reading: " + file.getName());
-    var doc = DocumentApp.openById(file.getId());
-    var text = doc.getBody().getText();
-    resumeTexts.push("=== " + file.getName() + " ===\n" + text.substring(0, MAX_CHARS_PER_RESUME));
-  }
-
-  if (resumeTexts.length === 0) {
-    Logger.log("No new or updated resumes found. Profile is up to date.");
-    return;
-  }
-
-  Logger.log("Found " + resumeTexts.length + " new/updated resumes. Sending to Gemini.");
-
-  // --- READ EXISTING PROFILE SUMMARY ---
-  // Passes the existing summary to Gemini alongside only the changed resumes —
-  // Gemini merges new info into the existing summary rather than rewriting
-  // everything, preserving detail built up over previous runs.
-  const existingSummary = profileSheet.getRange("B3").getValue() || "";
-  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_KEY");
-
-  const prompt = `You are updating a job seeker's career profile based on new or updated resume content.
-
-Here is the existing profile summary:
-${existingSummary}
-
-Here are the new or updated resumes to incorporate:
-${resumeTexts.join("\n\n")}
-
-Based on all of this, return ONLY a JSON object with no markdown, no backticks, no explanation:
-{
-  "profile_summary": "updated 3-5 sentence profile summary incorporating any new experience, skills, or roles found in the updated resumes — preserve existing accurate information, add or update anything new",
-  "queries": [
-    "search query 1",
-    "search query 2",
-    "search query 3",
-    "search query 4",
-    "search query 5",
-    "search query 6",
-    "search query 7",
-    "search query 8",
-    "search query 9",
-    "search query 10"
-  ]
-}
-
-Query rules:
-- Each query should target a different angle of the candidate's background
-- Queries should be natural language job board search strings
-- Include "remote" in most queries given the candidate's preference
-- Cover: LLM evaluation, AI quality ops, AI enablement/training, localization, prompt engineering
-- Avoid overly generic queries — be specific enough to surface relevant roles`;
-
-  const payload = { contents: [{ parts: [{ text: prompt }] }] };
-  const options = {
-    method: "POST",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
-  const response = UrlFetchApp.fetch(url, options);
-  const json = JSON.parse(response.getContentText());
-
-  var result;
-  try {
-    const text = json.candidates[0].content.parts[0].text;
-    const cleaned = text.replace(/```json|```/g, "").trim();
-    result = JSON.parse(cleaned);
-  } catch(e) {
-    Logger.log("Gemini parse error in refreshProfile: " + e + " | Raw: " + response.getContentText());
-    return;
-  }
-
-  // --- WRITE UPDATED PROFILE BACK TO SHEET ---
-  // Overwrites the PROFILE tab with the new summary, updated queries, and a
-  // fresh last_updated timestamp — the next fetchJobs() run will automatically
-  // use the new queries without any other changes needed.
-  profileSheet.getRange("B2").setValue(new Date().toISOString());
-  profileSheet.getRange("B3").setValue(result.profile_summary);
-
-  var queries = result.queries;
-  for (var i = 0; i < queries.length; i++) {
-    profileSheet.getRange(4 + i, 1).setValue("query_" + (i + 1));
-    profileSheet.getRange(4 + i, 2).setValue(queries[i]);
-  }
-  for (var j = queries.length; j < 20; j++) {
-    profileSheet.getRange(4 + j, 1).setValue("");
-    profileSheet.getRange(4 + j, 2).setValue("");
-  }
-
-  Logger.log("Profile refreshed. " + queries.length + " queries written.");
-}
-
-
-// ============================================================
-// MAIN: FETCH NEW JOBS USING PROFILE QUERIES, ANALYZE WITH GEMINI
-// ============================================================
-
-function fetchJobs() {
-
-  // --- CONFIG ---
-  // NUM_PAGES is per query — with 10 queries and 1 page each, that's up to
-  // 100 jobs per run using 10 JSearch API requests from your 200/month budget.
+  // NUM_PAGES is per query — with 10 queries at 1 page each that's up to 100
+  // jobs per run using 10 JSearch API requests from your 200/month budget.
   // DATE_POSTED filters to jobs Google indexed in the last 7 days.
   const SHEET_NAME = "RAW";
   const PROFILE_SHEET_NAME = "PROFILE";
@@ -286,7 +68,7 @@ function fetchJobs() {
     return;
   }
 
-  // --- READ QUERIES AND PROFILE SUMMARY FROM PROFILE TAB ---
+  // --- READ QUERIES FROM PROFILE TAB ---
   // Reads all rows where column A starts with "query_" and collects column B
   // values as the search queries to run — adding or removing queries only
   // requires editing the PROFILE tab, not the code.
@@ -295,10 +77,7 @@ function fetchJobs() {
   const profileData = profileSheet.getDataRange().getValues();
 
   var queries = [];
-  var profileSummary = "";
-
   profileData.forEach(function(row) {
-    if (row[0] === "profile_summary") profileSummary = row[1];
     if (String(row[0]).startsWith("query_") && row[1]) queries.push(row[1]);
   });
 
@@ -316,9 +95,9 @@ function fetchJobs() {
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 
   // --- BUILD DEDUPLICATION SET ---
-  // Reads all existing job_id values into a Set before any queries run —
-  // the same job appearing in multiple query results only gets written once
-  // and only analyzed once, saving both JSearch quota and Gemini tokens.
+  // Reads all existing job_id values into a Set before any queries run — the
+  // same job appearing in multiple query results only gets written once, saving
+  // JSearch quota and preventing duplicate rows in the sheet.
   const lastRow = sheet.getLastRow();
   var existingIds = new Set();
   if (lastRow > 1) {
@@ -333,8 +112,8 @@ function fetchJobs() {
 
   // --- LOOP THROUGH EACH QUERY ---
   // For each query from the PROFILE tab, builds the JSearch URL, fetches results,
-  // and processes each job — deduplication Set prevents the same job appearing
-  // twice even when multiple queries return overlapping results.
+  // and writes raw rows to the sheet — NO Gemini calls here, keeping this fast
+  // and well within the 6-minute Apps Script execution limit.
   queries.forEach(function(query, queryIndex) {
     Logger.log("Query " + (queryIndex + 1) + "/" + queries.length + ": " + query);
 
@@ -377,9 +156,9 @@ function fetchJobs() {
       if (existingIds.has(job.job_id)) return;
 
       // --- MAP JSEARCH FIELDS TO COLUMN HEADERS ---
-      // headers.map() goes through every column header and matches it to the
-      // corresponding JSearch field — agent analysis columns are left blank
-      // since Gemini fills them immediately after the row is written.
+      // headers.map() iterates every column header and matches it to the
+      // corresponding JSearch field — all agent analysis columns are left blank
+      // since analyzeExistingJobs() fills them in the next step.
       const rowData = headers.map(function(header) {
         switch(header) {
           case "job_id":                    return job.job_id || "";
@@ -421,133 +200,25 @@ function fetchJobs() {
       existingIds.add(job.job_id);
       newCount++;
       totalNewCount++;
-
-      // --- EXTRACT DATE AND RUN GEMINI ANALYSIS ---
-      // extractPostDate runs on the FULL description before truncation —
-      // Gemini then gets the smart-truncated version (first 1500 + last 500 chars)
-      // to capture both intro context and requirements while skipping middle filler.
-      // Profile summary from PROFILE tab grounds the fit scoring against real content.
-      // New role_category values are auto-added to the CATEGORIES tab.
-      const fullDesc = job.job_description || "";
-      const regexDate = extractPostDate(fullDesc);
-
-      Utilities.sleep(4000); // stay under Gemini free tier rate limit of ~15 req/min
-
-      const newRowNumber = sheet.getLastRow();
-      const shortDesc = fullDesc.substring(0, 1500) + "\n...\n" + fullDesc.slice(-500);
-      const analysis = analyzeWithGemini(shortDesc, profileSummary);
-
-      // Auto-add any new role_category to the CATEGORIES tab
-      if (analysis.role_category) addCategory(analysis.role_category, "job");
-
-      sheet.getRange(newRowNumber, headers.indexOf("role_category") + 1).setValue(analysis.role_category || "");
-      sheet.getRange(newRowNumber, headers.indexOf("fit_score") + 1).setValue(analysis.fit_score || "");
-      sheet.getRange(newRowNumber, headers.indexOf("rationale") + 1).setValue(analysis.rationale || "");
-      sheet.getRange(newRowNumber, headers.indexOf("resume_recommended") + 1).setValue(analysis.resume_recommended || "");
-      sheet.getRange(newRowNumber, headers.indexOf("resume_edits_suggested") + 1).setValue(analysis.resume_edits_suggested || "");
-      sheet.getRange(newRowNumber, headers.indexOf("actual_post_date") + 1).setValue(regexDate || analysis.actual_post_date || "");
-
-      Logger.log("  Analyzed: " + job.job_title + " at " + job.employer_name + " | Score: " + analysis.fit_score + " | Category: " + analysis.role_category);
     });
 
-    Logger.log("  → " + newCount + " new jobs added from this query.");
-    Utilities.sleep(1000); // brief pause between queries
+    Logger.log("  → " + newCount + " new jobs written from this query.");
+    Utilities.sleep(500); // brief pause between queries
   });
 
-  Logger.log("Done. Total new jobs added: " + totalNewCount);
+  Logger.log("fetchJobsOnly done. Total new jobs written: " + totalNewCount);
 }
 
 
 // ============================================================
-// GEMINI ANALYSIS: SCORE AND CATEGORIZE A JOB DESCRIPTION
-// ============================================================
-
-function analyzeWithGemini(jobDescription, profileSummary) {
-
-  // --- GET GEMINI API KEY ---
-  // Retrieved from Script Properties — never written into the code itself.
-  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_KEY");
-
-  // --- USE PROFILE SUMMARY IF PROVIDED, OTHERWISE USE FALLBACK ---
-  // fetchJobs() passes the live profile summary from the PROFILE tab so Gemini
-  // always scores against current resume content — analyzeExistingJobs() reads
-  // it from the PROFILE tab too, with a hardcoded fallback if the tab is missing.
-  const candidateProfile = profileSummary || `8+ years experience in AI quality operations,
-LLM evaluation, annotation pipeline management, and training design. Skills include rubric
-development, adversarial prompt testing, KPI dashboard design, Power Automate, Python.
-Languages: C1 French, conversational German. Prefers remote, based in Kalamazoo MI,
-open to EU relocation. Target roles: AI Eval, AI Ops, AI Enablement, Localization.`;
-
-  // --- GET DYNAMIC CATEGORY INSTRUCTION ---
-  // Built before the prompt so it can be interpolated cleanly as a variable —
-  // reads the CATEGORIES tab to ensure job categorization stays consistent
-  // with resume categorization since both draw from the same list.
-  const categoryInstruction = getRoleCategoryInstruction();
-
-  // --- BUILD THE PROMPT ---
-  // The candidate profile grounds every analysis in real resume content pulled from
-  // the PROFILE tab — Gemini returns a JSON object whose keys match sheet column
-  // headers exactly so the script can write each value by column name with no
-  // translation or mapping needed between what Gemini returns and where it goes.
-  const prompt = `You are analyzing a job posting for a candidate with this background:
-${candidateProfile}
-
-Here is the job description:
-${jobDescription}
-
-Return ONLY a JSON object with no markdown, no backticks, no explanation:
-{
-  "role_category": "${categoryInstruction}",
-  "fit_score": "integer 0-100",
-  "rationale": "one sentence explaining the score",
-  "resume_recommended": "a short label describing the best resume type for this role",
-  "resume_edits_suggested": "one short sentence on what to tweak, or blank if none",
-  "actual_post_date": "look for any date near words like posted, date, listed, or updated — return as YYYY-MM-DD or empty string"
-}`;
-
-  const payload = { contents: [{ parts: [{ text: prompt }] }] };
-  const options = {
-    method: "POST",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
-  const response = UrlFetchApp.fetch(url, options);
-  const json = JSON.parse(response.getContentText());
-
-  // --- PARSE GEMINI RESPONSE ---
-  // Drills into the nested response structure, strips accidental markdown backticks,
-  // and parses the JSON — returns a safe empty object on failure so the script
-  // never crashes mid-run; failed rows can be retried with analyzeExistingJobs().
-  try {
-    const text = json.candidates[0].content.parts[0].text;
-    const cleaned = text.replace(/```json|```/g, "").trim();
-    return JSON.parse(cleaned);
-  } catch(e) {
-    Logger.log("Gemini parse error: " + e + " | Raw: " + response.getContentText());
-    return {
-      role_category: "",
-      fit_score: "",
-      rationale: "Analysis failed",
-      resume_recommended: "",
-      resume_edits_suggested: "",
-      actual_post_date: ""
-    };
-  }
-}
-
-
-// ============================================================
-// BACKFILL: ANALYZE EXISTING ROWS MISSING GEMINI OUTPUT
+// STEP 2: ANALYZE UNPROCESSED ROWS WITH GEMINI + RESUME READING
 // ============================================================
 
 function analyzeExistingJobs() {
 
   // --- GET SHEET, HEADERS, AND PROFILE SUMMARY ---
-  // Reads the PROFILE tab to get the current profile summary for grounding Gemini —
-  // falls back to the hardcoded string in analyzeWithGemini() if the tab is missing.
+  // Reads the PROFILE tab for the current profile summary to ground Gemini —
+  // falls back to the hardcoded string in analyzeWithGemini() if missing.
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("RAW");
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -574,6 +245,7 @@ function analyzeExistingJobs() {
   // one-based column number that getRange() expects when writing to specific cells.
   const fitScoreCol = headers.indexOf("fit_score") + 1;
   const jobDescCol = headers.indexOf("job_description") + 1;
+  const jobTitleCol = headers.indexOf("job_title") + 1;
   const roleCatCol = headers.indexOf("role_category") + 1;
   const rationaleCol = headers.indexOf("rationale") + 1;
   const resumeRecCol = headers.indexOf("resume_recommended") + 1;
@@ -589,7 +261,8 @@ function analyzeExistingJobs() {
 
   // --- LOOP THROUGH ROWS AND FILL BLANKS ---
   // Only processes rows where fit_score is empty AND job_description exists —
-  // rows already analyzed or missing a description are skipped entirely.
+  // rows already analyzed or missing a description are skipped entirely,
+  // making this safe to run multiple times without duplicating any work.
   allData.forEach(function(row, i) {
     const fitScore = row[fitScoreCol - 1];
     const jobDesc = row[jobDescCol - 1];
@@ -599,28 +272,262 @@ function analyzeExistingJobs() {
       return;
     }
 
-    Logger.log("Analyzing row " + (i + 2) + ": " + row[headers.indexOf("job_title")]);
+    Logger.log("Analyzing row " + (i + 2) + ": " + row[jobTitleCol - 1]);
 
+    // --- EXTRACT DATE BEFORE TRUNCATION ---
+    // Runs regex on the full description first so posting dates near the end
+    // aren't lost when we truncate for Gemini below.
     const regexDate = extractPostDate(jobDesc);
-    Utilities.sleep(4000);
 
+    // --- STEP 1: SCORE AND CATEGORIZE THE JOB ---
+    // Sends the smart-truncated description (start + end) to Gemini for scoring —
+    // first 1500 chars captures intro and responsibilities, last 500 captures
+    // requirements and salary that often appear at the bottom of postings.
+    Utilities.sleep(4000);
     const shortDesc = jobDesc.substring(0, 1500) + "\n...\n" + jobDesc.slice(-500);
     const analysis = analyzeWithGemini(shortDesc, profileSummary);
 
+    // Auto-add any new role_category to the CATEGORIES tab so it's available
+    // for future job and resume categorization calls.
     if (analysis.role_category) addCategory(analysis.role_category, "job");
 
+    // --- STEP 2: FIND BEST RESUME AND READ ITS CONTENT ---
+    // Uses the role_category assigned by Gemini to look up matching resumes
+    // in the RESUMES tab, then reads the actual Doc content from Drive —
+    // this gives Gemini real resume text to compare against the job description
+    // rather than guessing based on category labels alone.
+    var resumeContent = "";
+    var recommendedResumeName = analysis.resume_recommended || "";
+
+    var matchingResumes = getResumesByCategory(analysis.role_category || "");
+
+    if (matchingResumes.length > 0) {
+      // Use the first matching resume — best candidate given category alignment
+      var bestResume = matchingResumes[0];
+      recommendedResumeName = bestResume.filename;
+      resumeContent = getResumeContent(bestResume.doc_id);
+      Logger.log("  Reading resume: " + recommendedResumeName);
+    }
+
+    // --- STEP 3: GET TARGETED EDIT SUGGESTIONS ---
+    // Only runs if we successfully read a resume — sends both the job description
+    // and the actual resume content to Gemini and asks for specific gap analysis,
+    // returning edits grounded in what's actually missing rather than guesses.
+    var resumeEdits = analysis.resume_edits_suggested || "";
+
+    if (resumeContent) {
+      Utilities.sleep(4000);
+      resumeEdits = getResumeEditSuggestions(shortDesc, resumeContent, recommendedResumeName);
+    }
+
+    // --- WRITE ALL RESULTS TO THE ROW ---
+    // Writes every analysis field back to the correct column in this row —
+    // uses column position found by name so order in the sheet doesn't matter.
     const rowNumber = i + 2;
     sheet.getRange(rowNumber, roleCatCol).setValue(analysis.role_category || "");
     sheet.getRange(rowNumber, fitScoreCol).setValue(analysis.fit_score || "");
     sheet.getRange(rowNumber, rationaleCol).setValue(analysis.rationale || "");
-    sheet.getRange(rowNumber, resumeRecCol).setValue(analysis.resume_recommended || "");
-    sheet.getRange(rowNumber, resumeEditsCol).setValue(analysis.resume_edits_suggested || "");
+    sheet.getRange(rowNumber, resumeRecCol).setValue(recommendedResumeName);
+    sheet.getRange(rowNumber, resumeEditsCol).setValue(resumeEdits);
     sheet.getRange(rowNumber, actualPostDateCol).setValue(regexDate || analysis.actual_post_date || "");
+
+    Logger.log("  Score: " + analysis.fit_score + " | Category: " + analysis.role_category + " | Resume: " + recommendedResumeName);
 
     analyzed++;
   });
 
-  Logger.log("Done. Analyzed: " + analyzed + " | Skipped: " + skipped);
+  Logger.log("analyzeExistingJobs done. Analyzed: " + analyzed + " | Skipped: " + skipped);
+}
+
+
+// ============================================================
+// GEMINI: SCORE AND CATEGORIZE A JOB DESCRIPTION
+// ============================================================
+
+function analyzeWithGemini(jobDescription, profileSummary) {
+
+  // --- GET GEMINI API KEY ---
+  // Retrieved from Script Properties — never written into the code itself.
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_KEY");
+
+  // --- CANDIDATE PROFILE ---
+  // fetchJobs() and analyzeExistingJobs() both pass the live profile summary
+  // from the PROFILE tab — the hardcoded fallback ensures the function still
+  // works even if the PROFILE tab is missing or empty.
+  const candidateProfile = profileSummary || `8+ years experience in AI quality operations,
+LLM evaluation, annotation pipeline management, and training design. Skills include rubric
+development, adversarial prompt testing, KPI dashboard design, Power Automate, Python.
+Languages: C1 French, conversational German. Prefers remote, based in Kalamazoo MI,
+open to EU relocation. Target roles: AI Eval, AI Ops, AI Enablement, Localization.`;
+
+  // --- DYNAMIC CATEGORY INSTRUCTION ---
+  // Built before the prompt so it can be interpolated cleanly as a variable —
+  // reads the CATEGORIES tab to keep job categorization consistent with resume
+  // categorization since both draw from the same list.
+  const categoryInstruction = getRoleCategoryInstruction();
+
+  // --- BUILD THE PROMPT ---
+  // Returns a JSON object whose keys match sheet column headers exactly —
+  // no translation needed between what Gemini returns and where it gets written.
+  const prompt = `You are analyzing a job posting for a candidate with this background:
+${candidateProfile}
+
+Here is the job description:
+${jobDescription}
+
+Return ONLY a JSON object with no markdown, no backticks, no explanation:
+{
+  "role_category": "${categoryInstruction}",
+  "fit_score": "integer 0-100 based on how well the candidate's background matches this role",
+  "rationale": "one sentence explaining the fit score",
+  "resume_recommended": "a short label describing the best resume type for this role",
+  "resume_edits_suggested": "leave blank — this will be filled separately after reading the actual resume",
+  "actual_post_date": "look for any date near words like posted, date, listed, or updated — return as YYYY-MM-DD or empty string"
+}`;
+
+  const payload = { contents: [{ parts: [{ text: prompt }] }] };
+  const options = {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
+  const response = UrlFetchApp.fetch(url, options);
+  const json = JSON.parse(response.getContentText());
+
+  // --- PARSE GEMINI RESPONSE ---
+  // Drills into the nested response structure, strips accidental markdown backticks,
+  // and parses the JSON — returns a safe empty object on failure so the script
+  // never crashes mid-run; failed rows will be retried on the next run.
+  try {
+    const text = json.candidates[0].content.parts[0].text;
+    const cleaned = text.replace(/```json|```/g, "").trim();
+    return JSON.parse(cleaned);
+  } catch(e) {
+    Logger.log("Gemini parse error: " + e + " | Raw: " + response.getContentText());
+    return {
+      role_category: "",
+      fit_score: "",
+      rationale: "Analysis failed",
+      resume_recommended: "",
+      resume_edits_suggested: "",
+      actual_post_date: ""
+    };
+  }
+}
+
+
+// ============================================================
+// GEMINI: GET TARGETED RESUME EDIT SUGGESTIONS
+// ============================================================
+
+function getResumeEditSuggestions(jobDescription, resumeContent, resumeName) {
+  // Sends both the job description and the actual resume content to Gemini,
+  // asking it to compare the two and return specific, actionable edit suggestions
+  // based on real gaps — not guesses about what might be missing.
+  // This is a separate Gemini call from analyzeWithGemini() so the two tasks
+  // stay clean and the suggestions are always grounded in real resume content.
+
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_KEY");
+
+  const prompt = `You are a career advisor comparing a job description against a candidate's resume to find specific gaps and improvement opportunities.
+
+Resume name: ${resumeName}
+
+Resume content:
+${resumeContent.substring(0, 2000)}
+
+Job description:
+${jobDescription}
+
+Based on comparing these two documents, provide specific and actionable edit suggestions.
+Focus on:
+- Skills or keywords in the job description that are missing from the resume
+- Existing resume content that should be reframed to better match the job's language
+- Specific bullets that should be added, removed, or reworded
+- Anything the resume does well that directly matches this role
+
+Return ONLY a JSON object with no markdown, no backticks, no explanation:
+{
+  "gaps": "comma-separated list of skills or keywords in the job description missing from the resume",
+  "reframe": "one specific bullet or section to reframe and how",
+  "add": "one specific thing to add to the resume for this role",
+  "strength": "one thing already in the resume that directly matches this job",
+  "summary": "one concise sentence summarizing the most important edit to make"
+}`;
+
+  const payload = { contents: [{ parts: [{ text: prompt }] }] };
+  const options = {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const json = JSON.parse(response.getContentText());
+    const text = json.candidates[0].content.parts[0].text;
+    const cleaned = text.replace(/```json|```/g, "").trim();
+    const result = JSON.parse(cleaned);
+    // Return the summary as the cell value — full JSON stored for future use
+    return result.summary || "";
+  } catch(e) {
+    Logger.log("Resume edit suggestion error: " + e);
+    return "";
+  }
+}
+
+
+// ============================================================
+// HELPER: READ RESUME CONTENT FROM GOOGLE DRIVE
+// ============================================================
+
+function getResumeContent(docId) {
+  // Opens a Google Doc by its ID and returns the full plain text content —
+  // called by analyzeExistingJobs() to read the actual resume before sending
+  // it to Gemini for gap analysis. Returns empty string on any error so the
+  // script never crashes if a Doc is deleted or access is revoked.
+  if (!docId) return "";
+  try {
+    var doc = DocumentApp.openById(docId);
+    return doc.getBody().getText();
+  } catch(e) {
+    Logger.log("Could not read resume Doc " + docId + ": " + e);
+    return "";
+  }
+}
+
+
+// ============================================================
+// HELPER: EXTRACT POSTING DATE WITH REGEX
+// ============================================================
+
+function extractPostDate(text) {
+  // Scans the full untruncated job description for common date patterns near
+  // posting keywords — running on the full text before truncation means we never
+  // miss a date that appears after the character cutoff sent to Gemini.
+  if (!text) return "";
+
+  var patterns = [
+    /posted[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
+    /posted[:\s]+(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/i,
+    /date posted[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
+    /listing date[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
+    /posted on[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
+    /updated[:\s]+(\w+ \d{1,2},?\s*\d{4})/i,
+    /listed[:\s]+(\w+ \d{1,2},?\s*\d{4})/i
+  ];
+
+  for (var i = 0; i < patterns.length; i++) {
+    var match = text.match(patterns[i]);
+    if (match) return match[1].trim();
+  }
+  return "";
 }
 
 
@@ -629,7 +536,6 @@ function analyzeExistingJobs() {
 // ============================================================
 
 function backfillPostDates() {
-
   // Targets rows that have a job_description but no actual_post_date — runs regex
   // on the full description text without calling Gemini, so this is fast, free,
   // and safe to run on large numbers of rows at any time.
@@ -638,10 +544,7 @@ function backfillPostDates() {
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   const lastRow = sheet.getLastRow();
 
-  if (lastRow < 2) {
-    Logger.log("No data rows found.");
-    return;
-  }
+  if (lastRow < 2) { Logger.log("No data rows found."); return; }
 
   const jobDescCol = headers.indexOf("job_description") + 1;
   const actualPostDateCol = headers.indexOf("actual_post_date") + 1;
@@ -654,10 +557,7 @@ function backfillPostDates() {
     const jobDesc = row[jobDescCol - 1];
     const existingDate = row[actualPostDateCol - 1];
 
-    if (!jobDesc || existingDate !== "") {
-      skipped++;
-      return;
-    }
+    if (!jobDesc || existingDate !== "") { skipped++; return; }
 
     const regexDate = extractPostDate(jobDesc);
     if (regexDate) {
@@ -674,24 +574,260 @@ function backfillPostDates() {
 
 
 // ============================================================
+// HELPER: READ ALL EXISTING CATEGORIES FROM CATEGORIES TAB
+// ============================================================
+
+function getCategories() {
+  // Opens the CATEGORIES tab and returns a flat array of all category label
+  // strings — passed to Gemini so it picks a consistent existing label before
+  // creating something new. Creates the tab with headers if it doesn't exist.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  var catSheet = ss.getSheetByName("CATEGORIES");
+
+  if (!catSheet) {
+    catSheet = ss.insertSheet("CATEGORIES");
+    catSheet.getRange(1, 1, 1, 3).setValues([["category", "date_added", "source"]]);
+    Logger.log("Created new CATEGORIES tab.");
+    return [];
+  }
+
+  const data = catSheet.getDataRange().getValues();
+  var categories = [];
+  data.forEach(function(row, i) {
+    if (i === 0) return;
+    if (row[0]) categories.push(row[0]);
+  });
+  return categories;
+}
+
+
+// ============================================================
+// HELPER: ADD NEW CATEGORY TO CATEGORIES TAB IF NOT PRESENT
+// ============================================================
+
+function addCategory(category, source) {
+  // Checks whether the category already exists before adding — prevents
+  // duplicates even when Gemini returns something already in the list.
+  // Records the label, today's date, and whether it came from a job or resume.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const catSheet = ss.getSheetByName("CATEGORIES");
+  if (!catSheet) return;
+
+  const data = catSheet.getDataRange().getValues();
+  var exists = data.some(function(row) {
+    return row[0].toString().toLowerCase() === category.toLowerCase();
+  });
+
+  if (!exists) {
+    var today = new Date().toISOString().substring(0, 10);
+    catSheet.appendRow([category, today, source]);
+    Logger.log("New category added: " + category + " (source: " + source + ")");
+  }
+}
+
+
+// ============================================================
+// HELPER: BUILD DYNAMIC ROLE CATEGORY INSTRUCTION FOR GEMINI
+// ============================================================
+
+function getRoleCategoryInstruction() {
+  // Reads current categories from the CATEGORIES tab and returns a dynamic
+  // instruction string for the Gemini prompt — keeping job categorization
+  // consistent with resume categorization since both draw from the same list.
+  var categories = getCategories();
+  if (categories.length > 0) {
+    return "pick the closest match from: " + categories.join(", ") + " — or create a concise new 2-4 word label if none fit";
+  } else {
+    return "assign a concise 2-4 word category label that describes the target role";
+  }
+}
+
+
+// ============================================================
+// HELPER: GET RESUMES BY CATEGORY FOR JOB MATCHING
+// ============================================================
+
+function getResumesByCategory(category) {
+  // Reads the RESUMES tab and returns all rows where the category matches
+  // the given label — called by analyzeExistingJobs() so Gemini only reads
+  // relevant resume Docs rather than all 30+ files.
+  // Always includes General resumes as a fallback option.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const resumeSheet = ss.getSheetByName("RESUMES");
+  if (!resumeSheet) {
+    Logger.log("No RESUMES tab found — run buildResumeCatalog() first.");
+    return [];
+  }
+
+  const data = resumeSheet.getDataRange().getValues();
+  var matches = [];
+
+  data.forEach(function(row, i) {
+    if (i === 0) return;
+    var rowCategory = row[2];
+    if (rowCategory === category || rowCategory === "General") {
+      matches.push({
+        filename: row[0],
+        doc_id: row[1],
+        category: row[2],
+        url: row[4]
+      });
+    }
+  });
+
+  Logger.log("Found " + matches.length + " resumes for category: " + category);
+  return matches;
+}
+
+
+// ============================================================
+// PROFILE REFRESH: READ NEW RESUMES FROM DRIVE, UPDATE PROFILE TAB
+// ============================================================
+
+function refreshProfile() {
+
+  // --- CONFIG ---
+  // RESUME_FOLDER_ID: your Resume folder ID from the Drive URL
+  // MAX_CHARS_PER_RESUME: truncation limit per resume to manage token costs —
+  // only new/updated Docs are read so the total token cost stays low per run.
+  const RESUME_FOLDER_ID = "1FKMiQkLfq2rcDFRnplIS7kUbtms92E0I";
+  const PROFILE_SHEET_NAME = "PROFILE";
+  const MAX_CHARS_PER_RESUME = 3000;
+
+  // --- GET PROFILE SHEET AND READ LAST UPDATED TIMESTAMP ---
+  // The last_updated value in B2 tells the script which resumes to skip —
+  // only Docs modified after this date get re-read, keeping repeat runs cheap.
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const profileSheet = ss.getSheetByName(PROFILE_SHEET_NAME);
+  const lastUpdatedCell = profileSheet.getRange("B2").getValue();
+  const lastUpdated = lastUpdatedCell ? new Date(lastUpdatedCell) : new Date(0);
+  Logger.log("Profile last updated: " + lastUpdated);
+
+  // --- FIND NEW OR UPDATED RESUME DOCS IN DRIVE ---
+  // Filters to only Google Docs modified after the last_updated timestamp —
+  // PDFs and Word docs are automatically skipped without extra handling.
+  const folder = DriveApp.getFolderById(RESUME_FOLDER_ID);
+  const files = folder.getFiles();
+  var resumeTexts = [];
+
+  while (files.hasNext()) {
+    var file = files.next();
+    if (file.getMimeType() !== "application/vnd.google-apps.document") continue;
+    if (file.getLastUpdated() <= lastUpdated) {
+      Logger.log("Skipping unchanged: " + file.getName());
+      continue;
+    }
+    Logger.log("Reading: " + file.getName());
+    var doc = DocumentApp.openById(file.getId());
+    resumeTexts.push("=== " + file.getName() + " ===\n" + doc.getBody().getText().substring(0, MAX_CHARS_PER_RESUME));
+  }
+
+  if (resumeTexts.length === 0) {
+    Logger.log("No new or updated resumes found. Profile is up to date.");
+    return;
+  }
+
+  Logger.log("Found " + resumeTexts.length + " new/updated resumes. Sending to Gemini.");
+
+  // --- READ EXISTING PROFILE SUMMARY ---
+  // Passes the existing summary alongside only the changed resumes — Gemini
+  // merges new info rather than rewriting everything from scratch.
+  const existingSummary = profileSheet.getRange("B3").getValue() || "";
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_KEY");
+
+  const prompt = `You are updating a job seeker's career profile based on new or updated resume content.
+
+Here is the existing profile summary:
+${existingSummary}
+
+Here are the new or updated resumes to incorporate:
+${resumeTexts.join("\n\n")}
+
+Based on all of this, return ONLY a JSON object with no markdown, no backticks, no explanation:
+{
+  "profile_summary": "updated 3-5 sentence profile summary — preserve existing accurate information, add or update anything new from the resumes",
+  "queries": [
+    "search query 1",
+    "search query 2",
+    "search query 3",
+    "search query 4",
+    "search query 5",
+    "search query 6",
+    "search query 7",
+    "search query 8",
+    "search query 9",
+    "search query 10"
+  ]
+}
+
+Query rules:
+- Each query targets a different angle of the candidate's background
+- Natural language job board search strings
+- Include remote in most queries
+- Cover: LLM evaluation, AI quality ops, AI enablement/training, localization, prompt engineering
+- Specific enough to surface relevant roles`;
+
+  const payload = { contents: [{ parts: [{ text: prompt }] }] };
+  const options = {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey;
+  const response = UrlFetchApp.fetch(url, options);
+  const json = JSON.parse(response.getContentText());
+
+  var result;
+  try {
+    const text = json.candidates[0].content.parts[0].text;
+    const cleaned = text.replace(/```json|```/g, "").trim();
+    result = JSON.parse(cleaned);
+  } catch(e) {
+    Logger.log("Gemini parse error in refreshProfile: " + e);
+    return;
+  }
+
+  // --- WRITE UPDATED PROFILE BACK TO SHEET ---
+  // Overwrites the PROFILE tab with new summary, queries, and timestamp —
+  // the next fetchJobsOnly() run uses the new queries automatically.
+  profileSheet.getRange("B2").setValue(new Date().toISOString());
+  profileSheet.getRange("B3").setValue(result.profile_summary);
+
+  var queries = result.queries;
+  for (var i = 0; i < queries.length; i++) {
+    profileSheet.getRange(4 + i, 1).setValue("query_" + (i + 1));
+    profileSheet.getRange(4 + i, 2).setValue(queries[i]);
+  }
+  for (var j = queries.length; j < 20; j++) {
+    profileSheet.getRange(4 + j, 1).setValue("");
+    profileSheet.getRange(4 + j, 2).setValue("");
+  }
+
+  Logger.log("Profile refreshed. " + queries.length + " queries written.");
+}
+
+
+// ============================================================
 // RESUME CATALOG: BUILD AND MAINTAIN RESUMES TAB
 // ============================================================
 
 function buildResumeCatalog() {
 
   // --- CONFIG ---
-  // CUTOFF_YEAR automatically excludes 2017-2020 era resumes without manual
-  // filtering — anything last modified before this year is skipped entirely.
-  // MAX_CHARS controls how much of each resume Gemini reads for categorization —
-  // 500 characters is enough to identify the role focus without burning tokens.
+  // CUTOFF_YEAR automatically excludes pre-2023 resumes — anything last modified
+  // before this year is skipped so old unrelated resumes don't pollute the catalog.
+  // MAX_CHARS: how much of each resume Gemini reads for categorization —
+  // 500 characters identifies the role focus without burning tokens.
   const RESUME_FOLDER_ID = "1FKMiQkLfq2rcDFRnplIS7kUbtms92E0I";
   const RESUMES_SHEET_NAME = "RESUMES";
   const CUTOFF_YEAR = 2023;
   const MAX_CHARS = 500;
 
   // --- FILES TO EXCLUDE ---
-  // These are in the Resume folder but aren't resumes — job applications,
-  // interview prep docs, and old translation files are all excluded.
+  // Non-resume files in the folder — job applications, interview prep docs,
+  // and old translation files are all excluded by filename matching.
   const EXCLUDE_NAMES = [
     "Application_Grames",
     "ANet Interview Question",
@@ -717,9 +853,8 @@ function buildResumeCatalog() {
   }
 
   // --- READ EXISTING CATALOG ---
-  // Reads all doc_id values already in the catalog into a Set so we can skip
-  // files already processed — only new files get a Gemini call, keeping repeat
-  // runs fast and cheap regardless of how many resumes are in the folder.
+  // Reads all doc_id values already cataloged into a Set so only new files
+  // get a Gemini call — preserves manual category corrections on existing rows.
   const existingData = resumeSheet.getDataRange().getValues();
   var existingIds = new Set();
   var existingRowNums = {};
@@ -748,25 +883,15 @@ function buildResumeCatalog() {
   while (files.hasNext()) {
     var file = files.next();
 
-    // Skip non-Google Docs — PDFs and Word docs can't be read as plain text
-    if (file.getMimeType() !== "application/vnd.google-apps.document") {
-      skipped++;
-      continue;
-    }
+    if (file.getMimeType() !== "application/vnd.google-apps.document") { skipped++; continue; }
 
     var fileName = file.getName();
 
-    // Skip excluded filenames
     var isExcluded = EXCLUDE_NAMES.some(function(excluded) {
       return fileName.toLowerCase().indexOf(excluded.toLowerCase()) !== -1;
     });
-    if (isExcluded) {
-      Logger.log("Excluding: " + fileName);
-      skipped++;
-      continue;
-    }
+    if (isExcluded) { Logger.log("Excluding: " + fileName); skipped++; continue; }
 
-    // Skip files last modified before the cutoff year
     var lastModified = file.getLastUpdated();
     if (lastModified.getFullYear() < CUTOFF_YEAR) {
       Logger.log("Skipping old file (" + lastModified.getFullYear() + "): " + fileName);
@@ -778,8 +903,7 @@ function buildResumeCatalog() {
     var docUrl = file.getUrl();
     var lastModifiedStr = lastModified.toISOString().substring(0, 10);
 
-    // If already cataloged, just update the timestamp and move on —
-    // preserves any manual category corrections the user may have made.
+    // If already cataloged, update timestamp only — preserve manual corrections
     if (existingIds.has(docId)) {
       resumeSheet.getRange(existingRowNums[docId], 4).setValue(lastModifiedStr);
       updated++;
@@ -787,17 +911,14 @@ function buildResumeCatalog() {
       continue;
     }
 
-    // --- READ RESUME CONTENT AND CATEGORIZE ---
-    // Opens the Doc and reads just the first MAX_CHARS characters — enough for
-    // Gemini to identify the role focus without reading the whole resume.
-    // The categories array is refreshed after each new addition so subsequent
-    // calls within the same run see the updated list immediately.
+    // --- READ AND CATEGORIZE NEW RESUME ---
+    // Opens the Doc, reads the first MAX_CHARS, sends to Gemini for categorization,
+    // auto-adds any new category to the CATEGORIES tab, then writes the catalog row.
     var doc = DocumentApp.openById(docId);
     var resumeText = doc.getBody().getText().substring(0, MAX_CHARS);
     var category = categorizeResume(resumeText, fileName, categories, apiKey);
 
     addCategory(category, "resume");
-
     if (categories.indexOf(category) === -1) categories.push(category);
 
     resumeSheet.appendRow([fileName, docId, category, lastModifiedStr, docUrl]);
@@ -805,10 +926,10 @@ function buildResumeCatalog() {
     added++;
 
     Logger.log("Added: " + fileName + " → " + category);
-    Utilities.sleep(2000); // brief pause to avoid Gemini rate limits
+    Utilities.sleep(2000);
   }
 
-  Logger.log("Done. Added: " + added + " | Updated: " + updated + " | Skipped: " + skipped);
+  Logger.log("buildResumeCatalog done. Added: " + added + " | Updated: " + updated + " | Skipped: " + skipped);
   Logger.log("Review the RESUMES tab and manually correct any miscategorizations.");
 }
 
@@ -863,41 +984,4 @@ Return ONLY the category label, nothing else. No explanation, no punctuation, no
     Logger.log("Gemini categorization error for " + fileName + ": " + e);
     return "General";
   }
-}
-
-
-// ============================================================
-// HELPER: GET RESUMES BY CATEGORY FOR JOB MATCHING
-// ============================================================
-
-function getResumesByCategory(category) {
-  // Reads the RESUMES tab and returns all rows where the category matches
-  // the given label — used when building the resume recommendation feature
-  // so Gemini only reads relevant resume Docs rather than all 30+ files.
-  // Always includes General resumes as a fallback option.
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const resumeSheet = ss.getSheetByName("RESUMES");
-  if (!resumeSheet) {
-    Logger.log("No RESUMES tab found — run buildResumeCatalog() first.");
-    return [];
-  }
-
-  const data = resumeSheet.getDataRange().getValues();
-  var matches = [];
-
-  data.forEach(function(row, i) {
-    if (i === 0) return;
-    var rowCategory = row[2];
-    if (rowCategory === category || rowCategory === "General") {
-      matches.push({
-        filename: row[0],
-        doc_id: row[1],
-        category: row[2],
-        url: row[4]
-      });
-    }
-  });
-
-  Logger.log("Found " + matches.length + " resumes for category: " + category);
-  return matches;
 }
